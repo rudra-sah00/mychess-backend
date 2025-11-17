@@ -67,9 +67,11 @@ socket.on("connect_error", (error) => {
 | `offer-draw` | Client → Server | Propose draw to opponent |
 | `draw-response` | Client → Server | Accept/decline draw |
 | `resign` | Client → Server | Resign the game |
+| `play-with-bot` | Client → Server | Start game against AI bot |
 | `move-made` | Server → Client | Broadcast validated move |
 | `game-over` | Server → Client | Game ended |
 | `player-reconnected` | Server → Client | Opponent reconnected |
+| `clock-update` | Server → Client | Time remaining update |
 
 ### Matchmaking Events
 | Event | Direction | Description |
@@ -82,6 +84,7 @@ See:
 - `/docs/api/room-events.md` for room event payloads and examples
 - `/docs/api/chess-events.md` for game event payloads and examples
 - `/docs/guides/room-system.md` for room system guide
+- `/docs/guides/bot-system.md` for bot gameplay guide
 - `/docs/quickstart/room-quickstart.md` for quick start examples
 
 ## REST API Endpoints
