@@ -19,6 +19,23 @@ jest.mock("../../firebase/firebaseAdmin", () => ({
         }),
       })),
     })),
+    getFirestore: jest.fn(() => ({
+      collection: jest.fn(() => ({
+        doc: jest.fn(() => ({
+          set: jest.fn().mockResolvedValue(undefined),
+          get: jest.fn().mockResolvedValue({
+            exists: false,
+            data: () => null,
+          }),
+        })),
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        get: jest.fn().mockResolvedValue({
+          forEach: jest.fn(),
+        }),
+      })),
+    })),
   },
 }));
 

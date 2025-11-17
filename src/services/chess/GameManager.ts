@@ -43,6 +43,9 @@ export interface MoveData {
 export class GameManager {
   private games: Map<string, { engine: ChessEngine; clock?: ClockService; data: GameData }> = new Map();
   private db = firebaseAdmin.getDatabase();
+  private firestore = firebaseAdmin.getFirestore();
+  private cleanupDelayMs = 30000; // 30 seconds delay before cleanup
+  private cleanupTimers: Map<string, NodeJS.Timeout> = new Map();
 
   async createGame(
     whiteUid: string,
@@ -169,6 +172,9 @@ export class GameManager {
         clock.stop();
         data.clockState = clock.getState();
       }
+      
+      // Schedule cleanup after game completion
+      this.scheduleGameCleanup(gameId);
     }
 
     const moveNumber = engine.getGameState().history.length;
@@ -235,6 +241,10 @@ export class GameManager {
     });
 
     logger.info(`Player ${uid} resigned in game ${gameId}`);
+    
+    // Schedule cleanup after resignation
+    this.scheduleGameCleanup(gameId);
+    
     return result;
   }
 
@@ -303,6 +313,10 @@ export class GameManager {
       });
 
       logger.info(`Draw accepted in game ${gameId}`);
+      
+      // Schedule cleanup after draw
+      this.scheduleGameCleanup(gameId);
+      
       return result;
     } else {
       data.drawOffer = undefined;
@@ -336,7 +350,175 @@ export class GameManager {
       game.clock.stop();
     }
     this.games.delete(gameId);
+    
+    // Clear any pending cleanup timer
+    const timer = this.cleanupTimers.get(gameId);
+    if (timer) {
+      clearTimeout(timer);
+      this.cleanupTimers.delete(gameId);
+    }
+    
     logger.debug(`Game removed from memory: ${gameId}`);
+  }
+
+  /**
+   * Schedule automatic cleanup of completed game
+   * Removes game data from Firebase and memory after delay
+   */
+  private scheduleGameCleanup(gameId: string): void {
+    // Clear any existing timer for this game
+    const existingTimer = this.cleanupTimers.get(gameId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    // Schedule cleanup
+    const timer = setTimeout(async () => {
+      try {
+        await this.cleanupGame(gameId);
+      } catch (error) {
+        logger.error(`Failed to cleanup game ${gameId}:`, error);
+      } finally {
+        this.cleanupTimers.delete(gameId);
+      }
+    }, this.cleanupDelayMs);
+
+    this.cleanupTimers.set(gameId, timer);
+    logger.debug(`Scheduled cleanup for game ${gameId} in ${this.cleanupDelayMs}ms`);
+  }
+
+  /**
+   * Clean up completed game from Firebase and memory
+   * Archives to Firestore for permanent storage
+   */
+  private async cleanupGame(gameId: string): Promise<void> {
+    const game = this.games.get(gameId);
+    
+    if (!game) {
+      logger.debug(`Game ${gameId} already removed from memory`);
+      return;
+    }
+
+    if (game.data.status !== 'completed') {
+      logger.warn(`Attempted to cleanup active game ${gameId}, skipping`);
+      return;
+    }
+
+    const archiveData = {
+      ...game.data,
+      archivedAt: Date.now(),
+      completedAt: game.data.lastMoveAt || Date.now(),
+    };
+
+    try {
+      // Save to Firestore for permanent storage
+      await this.firestore.collection('completed_games').doc(gameId).set(archiveData);
+      
+      // Optionally keep in Realtime DB archive (faster queries for recent games)
+      await this.db.ref(`archived_games/${gameId}`).set(archiveData);
+      
+      // Delete from active games in Realtime DB
+      await this.db.ref(`games/${gameId}`).remove();
+      
+      // Remove from memory
+      this.removeGame(gameId);
+      
+      logger.info(`Game ${gameId} cleaned up, saved to Firestore and archived in RTDB`);
+    } catch (error) {
+      logger.error(`Error cleaning up game ${gameId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel scheduled cleanup for a game
+   */
+  cancelCleanup(gameId: string): void {
+    const timer = this.cleanupTimers.get(gameId);
+    if (timer) {
+      clearTimeout(timer);
+      this.cleanupTimers.delete(gameId);
+      logger.debug(`Cancelled cleanup for game ${gameId}`);
+    }
+  }
+
+  /**
+   * Set custom cleanup delay (useful for testing)
+   */
+  setCleanupDelay(delayMs: number): void {
+    this.cleanupDelayMs = delayMs;
+    logger.info(`Game cleanup delay set to ${delayMs}ms`);
+  }
+
+  /**
+   * Manually trigger cleanup for completed games
+   */
+  async cleanupCompletedGames(): Promise<number> {
+    let count = 0;
+    const promises: Promise<void>[] = [];
+
+    for (const [gameId, game] of this.games.entries()) {
+      if (game.data.status === 'completed') {
+        promises.push(this.cleanupGame(gameId));
+        count++;
+      }
+    }
+
+    await Promise.all(promises);
+    logger.info(`Manually cleaned up ${count} completed games`);
+    return count;
+  }
+
+  /**
+   * Get completed game from Firestore archive
+   */
+  async getCompletedGame(gameId: string): Promise<GameData | null> {
+    try {
+      const doc = await this.firestore.collection('completed_games').doc(gameId).get();
+      if (!doc.exists) {
+        return null;
+      }
+      return doc.data() as GameData;
+    } catch (error) {
+      logger.error(`Error fetching completed game ${gameId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get player's completed games from Firestore
+   */
+  async getPlayerCompletedGames(uid: string, limit: number = 10): Promise<GameData[]> {
+    try {
+      const snapshot = await this.firestore
+        .collection('completed_games')
+        .where('whitePlayer.uid', '==', uid)
+        .orderBy('completedAt', 'desc')
+        .limit(limit)
+        .get();
+
+      const blackGamesSnapshot = await this.firestore
+        .collection('completed_games')
+        .where('blackPlayer.uid', '==', uid)
+        .orderBy('completedAt', 'desc')
+        .limit(limit)
+        .get();
+
+      const games: GameData[] = [];
+      snapshot.forEach(doc => games.push(doc.data() as GameData));
+      blackGamesSnapshot.forEach(doc => games.push(doc.data() as GameData));
+
+      // Sort by completion time and deduplicate
+      return games
+        .filter((game, index, self) => 
+          index === self.findIndex(g => g.gameId === game.gameId)
+        )
+        .sort((a, b) => (b.lastMoveAt || 0) - (a.lastMoveAt || 0))
+        .slice(0, limit);
+    } catch (error) {
+      logger.error(`Error fetching player games for ${uid}:`, error);
+      return [];
+    }
   }
 
   private async handleTimeout(gameId: string, timedOutColor: "w" | "b"): Promise<void> {
@@ -363,6 +545,9 @@ export class GameManager {
     });
 
     logger.warn(`Game ${gameId} ended by timeout: ${timedOutColor}`);
+    
+    // Schedule cleanup after timeout
+    this.scheduleGameCleanup(gameId);
   }
 
   private handleClockUpdate(gameId: string, clockState: ClockState): void {

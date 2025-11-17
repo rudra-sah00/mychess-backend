@@ -83,12 +83,18 @@ export const getDatabase = () => {
   return app.database();
 };
 
+export const getFirestore = () => {
+  const app = getFirebaseApp();
+  return app.firestore();
+};
+
 export const firebaseAdmin = {
   verifyIdToken,
   createSessionCookie,
   verifySessionCookie,
   revokeRefreshTokens,
   getDatabase,
+  getFirestore,
 };
 
 export default firebaseAdmin;
