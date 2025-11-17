@@ -108,7 +108,6 @@ export const registerChessNamespace = (io: Server) => {
 
   chessNs.on("connection", (socket: Socket) => {
     const uid = socket.data.uid as string;
-    logger.info(`Socket connected to /chess namespace: ${socket.id} (uid: ${uid})`);
 
     // Join game
     socket.on("join-game", async (payload: JoinGamePayload, callback?: (response: { success: boolean; gameState?: unknown; error?: string }) => void) => {
@@ -181,7 +180,7 @@ export const registerChessNamespace = (io: Server) => {
         const result = await gameManager.applyMove(gameId, uid, from, to, promotion);
 
         if (!result.success) {
-          logger.warn(`Move rejected in game ${gameId}: ${result.error}`);
+          logger.warn(`Move rejected in game ${gameId} by ${uid}: ${result.error} (from: ${from}, to: ${to})`);
           callback?.({ success: false, error: result.error });
           return;
         }
@@ -332,7 +331,6 @@ export const registerChessNamespace = (io: Server) => {
 
     // Disconnect
     socket.on("disconnect", () => {
-      logger.info(`Socket disconnected from /chess namespace: ${socket.id} (uid: ${uid})`);
       // Remove from matchmaking queue on disconnect
       matchmakingService.leaveQueue(uid);
       // Leave room on disconnect

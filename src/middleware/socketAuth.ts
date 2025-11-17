@@ -18,7 +18,6 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
       try {
         const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
         uid = decodedClaims.uid;
-        logger.debug(`Socket authenticated via session cookie: ${uid}`);
       } catch (error) {
         logger.warn(`Invalid session cookie: ${error instanceof Error ? error.message : "Unknown error"}`);
       }
@@ -29,7 +28,6 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
       try {
         const decodedToken = await firebaseAdmin.verifyIdToken(token);
         uid = decodedToken.uid;
-        logger.debug(`Socket authenticated via ID token: ${uid}`);
       } catch (error) {
         logger.warn(`Invalid ID token: ${error instanceof Error ? error.message : "Unknown error"}`);
       }
@@ -42,7 +40,6 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
 
     // Attach uid to socket data for use in event handlers
     socket.data.uid = uid;
-    logger.info(`Socket authenticated: ${socket.id} (uid: ${uid})`);
     next();
   } catch (error) {
     logger.error(`Socket authentication error: ${error instanceof Error ? error.message : "Unknown error"}`);
