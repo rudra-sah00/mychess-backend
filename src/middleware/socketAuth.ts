@@ -40,6 +40,13 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
 
     // Attach uid to socket data for use in event handlers
     socket.data.uid = uid;
+    
+    // Extract username from query params if available
+    const username = socket.handshake.query.username as string | undefined;
+    socket.data.username = username || 'Player';
+    
+    logger.debug(`Socket authenticated: uid=${uid}, username=${socket.data.username}`);
+    
     next();
   } catch (error) {
     logger.error(`Socket authentication error: ${error instanceof Error ? error.message : "Unknown error"}`);

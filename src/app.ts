@@ -63,5 +63,5 @@ export const createHttpServer = () => {
 
   registerChessNamespace(io);
 
-  return { app, httpServer };
+  return { app, httpServer, io };
 };

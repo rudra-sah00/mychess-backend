@@ -45,8 +45,20 @@ describe("GameManager", () => {
   const mockWhiteSocket = "socket-white-123";
   const mockBlackSocket = "socket-black-456";
 
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
   afterEach(() => {
     jest.clearAllMocks();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    
+    // Clean up all games
+    const allGames = (gameManager as any).games;
+    for (const [gameId] of allGames) {
+      gameManager.removeGame(gameId);
+    }
   });
 
   describe("createGame", () => {

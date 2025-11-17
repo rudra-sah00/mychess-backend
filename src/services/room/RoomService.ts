@@ -7,6 +7,7 @@ export interface RoomPlayer {
   socketId: string;
   joinedAt: number;
   isReady: boolean;
+  colorPreference?: "white" | "black" | "random";
 }
 
 export interface RoomData {
@@ -223,7 +224,11 @@ export class RoomService {
   /**
    * Set player ready status
    */
-  setPlayerReady(uid: string, isReady: boolean): { success: boolean; room?: RoomData; allReady?: boolean; error?: string } {
+  setPlayerReady(
+    uid: string,
+    isReady: boolean,
+    colorPreference?: "white" | "black" | "random"
+  ): { success: boolean; room?: RoomData; allReady?: boolean; error?: string } {
     const roomId = this.playerToRoom.get(uid);
     if (!roomId) {
       return { success: false, error: "Not in a room" };
@@ -240,6 +245,12 @@ export class RoomService {
     }
 
     player.isReady = isReady;
+    
+    // Store color preference if provided (host only)
+    if (colorPreference && uid === room.hostUid) {
+      player.colorPreference = colorPreference;
+      logger.info(`Host ${uid} set color preference: ${colorPreference}`);
+    }
 
     // Update Firebase
     this.db.ref(`rooms/${roomId}/players`).set(

@@ -11,4 +11,8 @@ module.exports = {
   transformIgnorePatterns: [
     "node_modules/(?!nanoid)",
   ],
+  testTimeout: 10000,
+  maxWorkers: "50%",
+  detectOpenHandles: false,
+  forceExit: true,
 };

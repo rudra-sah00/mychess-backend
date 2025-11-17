@@ -1,4 +1,5 @@
-import Stockfish from 'stockfish.wasm';
+import * as fs from 'fs';
+import * as path from 'path';
 import logger from '../../config/logger';
 
 export type BotDifficulty = 'easy' | 'medium' | 'hard';
@@ -56,50 +57,103 @@ export class BotService {
    * Initialize the Stockfish engine
    */
   async initialize(): Promise<void> {
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       try {
-        this.engine = await Stockfish();
-        
-        this.engine.addMessageListener((message: string) => {
-          logger.debug(`[Bot] Stockfish: ${message}`);
-          
-          if (message === 'uciok') {
-            this.isReady = true;
-            logger.info(`[Bot] Stockfish initialized (${this.difficulty})`);
-          }
-          
-          // Extract best move from engine output
-          if (message.startsWith('bestmove')) {
-            const match = message.match(/bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/);
-            if (match && this.pendingMoveResolver) {
-              const move = match[1];
-              logger.debug(`[Bot] Best move found: ${move}`);
-              this.pendingMoveResolver(move);
-              this.pendingMoveResolver = null;
-            }
+        const engineDir = path.join(__dirname, '../../../node_modules/stockfish/src');
+        const enginePath = path.join(engineDir, 'stockfish-17.1-single-a496a04.js');
+        const wasmPath = path.join(engineDir, 'stockfish-17.1-single-a496a04-part-0.wasm');
+        const basename = 'stockfish-17.1-single-a496a04';
+
+        // Load WASM parts
+        const buffers: Buffer[] = [];
+        fs.readdirSync(engineDir).sort().forEach((file) => {
+          if (file.startsWith(basename + '-part-') && file.endsWith('.wasm')) {
+            buffers.push(fs.readFileSync(path.join(engineDir, file)));
           }
         });
 
-        // Initialize UCI protocol
-        this.engine.postMessage('uci');
+        const INIT_ENGINE = require(enginePath);
         
-        // Wait for engine to be ready
-        const timeout = setTimeout(() => {
-          reject(new Error('Stockfish initialization timeout'));
-        }, 5000);
+        const engineConfig: any = {
+          locateFile: (file: string) => {
+            if (file.indexOf('.wasm') > -1) {
+              return wasmPath;
+            }
+            return enginePath;
+          },
+        };
 
-        const checkReady = setInterval(() => {
-          if (this.isReady) {
-            clearInterval(checkReady);
-            clearTimeout(timeout);
-            
-            // Set skill level and options
-            this.engine.postMessage(`setoption name Skill Level value ${this.config.skillLevel}`);
-            this.engine.postMessage('isready');
-            
-            resolve();
-          }
-        }, 100);
+        if (buffers.length) {
+          engineConfig.wasmBinary = Buffer.concat(buffers);
+        }
+
+        // INIT_ENGINE() returns a function, calling that function returns a Promise
+        const Stockfish = INIT_ENGINE();
+        
+        Stockfish(engineConfig).then((engine: any) => {
+          const checkIfReady = () => {
+            if (engineConfig._isReady && !engineConfig._isReady()) {
+              return setTimeout(checkIfReady, 10);
+            }
+            delete engineConfig._isReady;
+
+            // Set up command sender
+            engine.sendCommand = (cmd: string) => {
+              setImmediate(() => {
+                engine.ccall('command', null, ['string'], [cmd], { async: /^go\b/.test(cmd) });
+              });
+            };
+
+            // Set up output handler
+            engine.listener = (line: string) => {
+              logger.debug(`[Bot] Stockfish: ${line}`);
+
+              if (line === 'uciok') {
+                this.isReady = true;
+                logger.info(`[Bot] Stockfish initialized (${this.difficulty})`);
+              }
+
+              if (line.startsWith('bestmove')) {
+                const match = line.match(/bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/);
+                if (match && this.pendingMoveResolver) {
+                  const move = match[1];
+                  logger.debug(`[Bot] Best move found: ${move}`);
+                  this.pendingMoveResolver(move);
+                  this.pendingMoveResolver = null;
+                }
+              }
+            };
+
+            this.engine = engine;
+
+            // Initialize UCI protocol
+            engine.sendCommand('uci');
+
+            // Wait for engine to be ready
+            const timeout = setTimeout(() => {
+              reject(new Error('Stockfish initialization timeout'));
+            }, 5000);
+
+            const checkReady = setInterval(() => {
+              if (this.isReady) {
+                clearInterval(checkReady);
+                clearTimeout(timeout);
+
+                // Set skill level and options
+                engine.sendCommand(`setoption name Skill Level value ${this.config.skillLevel}`);
+                engine.sendCommand('isready');
+
+                resolve();
+              }
+            }, 100);
+          };
+
+          checkIfReady();
+        }).catch((err: any) => {
+          logger.error('[Bot] Stockfish initialization error:', err);
+          reject(err);
+        });
+
       } catch (error) {
         logger.error('[Bot] Failed to initialize Stockfish:', error);
         reject(error);
@@ -121,13 +175,13 @@ export class BotService {
       this.pendingMoveResolver = resolve;
 
       // Set position
-      this.engine.postMessage(`position fen ${fen}`);
+      this.engine.sendCommand(`position fen ${fen}`);
       
       // Start calculating
       if (this.config.moveTime) {
-        this.engine.postMessage(`go movetime ${this.config.moveTime}`);
+        this.engine.sendCommand(`go movetime ${this.config.moveTime}`);
       } else {
-        this.engine.postMessage(`go depth ${this.config.depth}`);
+        this.engine.sendCommand(`go depth ${this.config.depth}`);
       }
 
       // Timeout fallback
@@ -144,8 +198,8 @@ export class BotService {
    * Terminate the engine
    */
   terminate(): void {
-    if (this.engine) {
-      this.engine.postMessage('quit');
+    if (this.engine && this.engine.sendCommand) {
+      this.engine.sendCommand('quit');
       this.isReady = false;
       logger.info('[Bot] Stockfish terminated');
     }

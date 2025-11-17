@@ -37,9 +37,8 @@ const getFirebaseApp = () => {
       throw new Error("Firebase project ID not found in service account file");
     }
     
-    // Use environment variable if set, otherwise use default US region
-    // For Asia region databases, set FIREBASE_DATABASE_URL in .env
-    const databaseURL = process.env.FIREBASE_DATABASE_URL || `https://${projectId}-default-rtdb.firebaseio.com`;
+    // Use environment variable if set, otherwise use Asia Southeast region
+    const databaseURL = process.env.FIREBASE_DATABASE_URL || `https://${projectId}-default-rtdb.asia-southeast1.firebasedatabase.app`;
 
     firebaseApp = admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),

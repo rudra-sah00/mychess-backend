@@ -4,6 +4,7 @@ import { gameManager } from "../../services/chess/GameManager";
 import { matchmakingService } from "../../services/matchmaking/MatchmakingService";
 import { roomService } from "../../services/room/RoomService";
 import { BotManager, BotDifficulty } from "../../services/bot/BotService";
+import { gamePersistenceService } from "../../services/firebase/GamePersistenceService";
 import logger from "../../config/logger";
 
 const botManager = new BotManager();
@@ -57,10 +58,12 @@ interface JoinRoomPayload {
 
 interface SetReadyPayload {
   isReady: boolean;
+  colorPreference?: "white" | "black" | "random";
 }
 
 interface PlayWithBotPayload {
   difficulty: BotDifficulty;
+  playerColor?: 'white' | 'black' | 'random';
   timeControl?: {
     initialTimeMs: number;
     incrementMs: number;
@@ -106,8 +109,38 @@ export const registerChessNamespace = (io: Server) => {
     logger.info(`Match-found notifications sent for game ${gameId}`);
   });
 
-  chessNs.on("connection", (socket: Socket) => {
+  chessNs.on("connection", async (socket: Socket) => {
     const uid = socket.data.uid as string;
+    const username = socket.data.username as string || 'Player';
+
+    logger.info(`Player ${uid} (${username}) connected to chess namespace`);
+
+    // Check for active game on connection
+    const activeGameCheck = await gameManager.checkActiveGame(uid);
+    if (activeGameCheck.hasActiveGame) {
+      logger.info(`Player ${uid} has active game: ${activeGameCheck.gameId}`);
+      
+      // Notify client about active game (client will decide to rejoin or clear)
+      socket.emit("active-game-found", {
+        gameId: activeGameCheck.gameId,
+        gameData: activeGameCheck.gameData,
+      });
+
+      // Mark player as reconnected
+      await gameManager.handlePlayerReconnect(activeGameCheck.gameId!, uid);
+    }
+
+    // Handle clear-active-game event
+    socket.on("clear-active-game", async (callback?: (response: { success: boolean }) => void) => {
+      try {
+        await gamePersistenceService.removeActiveGame(uid);
+        logger.info(`Cleared active game for user ${uid}`);
+        callback?.({ success: true });
+      } catch (error) {
+        logger.error(`Error clearing active game for ${uid}:`, error);
+        callback?.({ success: false });
+      }
+    });
 
     // Join game
     socket.on("join-game", async (payload: JoinGamePayload, callback?: (response: { success: boolean; gameState?: unknown; error?: string }) => void) => {
@@ -170,9 +203,17 @@ export const registerChessNamespace = (io: Server) => {
       try {
         const { gameId, from, to, promotion } = payload;
 
+        logger.info(`Make-move request: gameId=${gameId}, uid=${uid}, from=${from}, to=${to}, promotion=${promotion}`);
+
         // Validate inputs
         if (!gameId || !from || !to) {
           callback?.({ success: false, error: "Missing required fields" });
+          return;
+        }
+
+        if (!uid) {
+          logger.error("Make-move error: uid is undefined");
+          callback?.({ success: false, error: "User not authenticated" });
           return;
         }
 
@@ -197,13 +238,19 @@ export const registerChessNamespace = (io: Server) => {
 
         // Broadcast move to all players
         chessNs.to(gameId).emit("move-made", {
+          gameId,
           from,
           to,
           promotion,
           san: result.move!.san,
+          move: result.move,
           fen: game.fen,
-          turn: game.turn,
+          currentTurn: game.turn === 'w' ? 'white' : 'black',
+          gameStatus: game.status,
           clockState: game.clockState,
+          isCheck: result.move?.san.includes('+') || false,
+          isCheckmate: result.isGameOver && result.winner !== 'draw',
+          isDraw: result.winner === 'draw',
         });
 
         // Check for game over
@@ -233,7 +280,8 @@ export const registerChessNamespace = (io: Server) => {
 
         logger.info(`Move made in game ${gameId}: ${from} to ${to} by ${uid}`);
       } catch (error) {
-        logger.error(`Make move error: ${error instanceof Error ? error.message : "Unknown error"}`);
+        logger.error(`Make move error in game ${payload.gameId}: ${error instanceof Error ? error.message : "Unknown error"}`);
+        logger.error(`Error stack: ${error instanceof Error ? error.stack : "No stack trace"}`);
         callback?.({ success: false, error: "Failed to make move" });
       }
     });
@@ -330,9 +378,12 @@ export const registerChessNamespace = (io: Server) => {
     });
 
     // Disconnect
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
+      logger.info(`Player ${uid} disconnected from chess namespace`);
+
       // Remove from matchmaking queue on disconnect
       matchmakingService.leaveQueue(uid);
+      
       // Leave room on disconnect
       const result = roomService.leaveRoom(uid);
       if (result.success && result.roomId && !result.disbanded) {
@@ -344,6 +395,18 @@ export const registerChessNamespace = (io: Server) => {
             room,
           });
         }
+      }
+
+      // Check if player is in an active game
+      const activeGame = await gameManager.checkActiveGame(uid);
+      if (activeGame.hasActiveGame && activeGame.gameId) {
+        logger.info(`Player ${uid} disconnected from active game ${activeGame.gameId}`);
+        
+        // Notify opponent
+        socket.to(activeGame.gameId).emit("player-disconnected", { uid });
+        
+        // Handle disconnection with timeout
+        await gameManager.handlePlayerDisconnect(activeGame.gameId, uid);
       }
     });
 
@@ -441,7 +504,7 @@ export const registerChessNamespace = (io: Server) => {
     // Set ready status
     socket.on("set-ready", async (payload: SetReadyPayload, callback?: (response: { success: boolean; allReady?: boolean; error?: string }) => void) => {
       try {
-        const result = roomService.setPlayerReady(uid, payload.isReady);
+        const result = roomService.setPlayerReady(uid, payload.isReady, payload.colorPreference);
 
         if (!result.success) {
           callback?.({ success: false, error: result.error });
@@ -465,15 +528,42 @@ export const registerChessNamespace = (io: Server) => {
 
           const room = result.room!;
           const [player1, player2] = room.players;
+          
+          // Determine colors based on host's preference
+          const host = room.players.find(p => p.uid === room.hostUid)!;
+          const guest = room.players.find(p => p.uid !== room.hostUid)!;
+          
+          let whitePlayer = player1;
+          let blackPlayer = player2;
+          
+          if (host.colorPreference === "white") {
+            // Host wants white
+            whitePlayer = host;
+            blackPlayer = guest;
+            logger.info(`Host ${host.uid} chose white, guest ${guest.uid} is black`);
+          } else if (host.colorPreference === "black") {
+            // Host wants black
+            whitePlayer = guest;
+            blackPlayer = host;
+            logger.info(`Host ${host.uid} chose black, guest ${guest.uid} is white`);
+          } else {
+            // Random assignment
+            const randomChoice = Math.random() < 0.5;
+            whitePlayer = randomChoice ? host : guest;
+            blackPlayer = randomChoice ? guest : host;
+            logger.info(`Random color assignment: host ${host.uid} is ${randomChoice ? 'white' : 'black'}`);
+          }
 
           // Create game
           const gameData = await gameManager.createGame(
-            player1.uid,
-            player2.uid,
-            player1.socketId,
-            player2.socketId,
+            whitePlayer.uid,
+            blackPlayer.uid,
+            whitePlayer.socketId,
+            blackPlayer.socketId,
             room.timeControl,
-            roomId
+            roomId,
+            username, // Pass username for both players (they're in the same room)
+            username
           );
 
           // Update room with game ID
@@ -487,8 +577,8 @@ export const registerChessNamespace = (io: Server) => {
           const gameStartingPayload = {
             roomId,
             gameId: gameData.gameId,
-            whitePlayer: player1.uid,
-            blackPlayer: player2.uid,
+            whitePlayer: whitePlayer.uid,
+            blackPlayer: blackPlayer.uid,
             gameState: {
               gameId: gameData.gameId,
               fen: gameData.fen,
@@ -505,11 +595,11 @@ export const registerChessNamespace = (io: Server) => {
           chessNs.in(roomId).emit("game-starting", gameStartingPayload);
           
           // Also emit directly to both players as backup
-          if (player1.socketId) {
-            chessNs.to(player1.socketId).emit("game-starting", gameStartingPayload);
+          if (whitePlayer.socketId) {
+            chessNs.to(whitePlayer.socketId).emit("game-starting", gameStartingPayload);
           }
-          if (player2.socketId) {
-            chessNs.to(player2.socketId).emit("game-starting", gameStartingPayload);
+          if (blackPlayer.socketId) {
+            chessNs.to(blackPlayer.socketId).emit("game-starting", gameStartingPayload);
           }
 
           logger.info(`Game ${gameData.gameId} starting in room ${roomId}`);
@@ -595,18 +685,30 @@ export const registerChessNamespace = (io: Server) => {
       payload: PlayWithBotPayload,
       callback?: (response: { success: boolean; gameId?: string; color?: string; error?: string }) => void
     ) => {
+      logger.info(`🤖 Received play-with-bot request from ${uid} (${username}) - difficulty: ${payload.difficulty}`);
+      
       try {
-        const { difficulty = 'medium', timeControl } = payload;
+        const { difficulty = 'medium', playerColor: requestedColor, timeControl } = payload;
 
         // Validate difficulty
         if (!['easy', 'medium', 'hard'].includes(difficulty)) {
+          logger.warn(`Invalid difficulty: ${difficulty}`);
           callback?.({ success: false, error: 'Invalid difficulty level' });
           return;
         }
 
-        // Randomly assign color to player
-        const playerColor = Math.random() < 0.5 ? 'white' : 'black';
+        // Determine player color
+        let playerColor: 'white' | 'black';
+        if (requestedColor === 'random' || !requestedColor) {
+          playerColor = Math.random() < 0.5 ? 'white' : 'black';
+        } else {
+          playerColor = requestedColor as 'white' | 'black';
+        }
         const botColor = playerColor === 'white' ? 'black' : 'white';
+
+        logger.info(`Creating bot game: player=${playerColor}, bot=${botColor}`)
+
+;
 
         // Create game with player and bot
         const game = await gameManager.createGame(
@@ -614,11 +716,18 @@ export const registerChessNamespace = (io: Server) => {
           playerColor === 'black' ? uid : 'BOT',
           playerColor === 'white' ? socket.id : 'BOT_SOCKET',
           playerColor === 'black' ? socket.id : 'BOT_SOCKET',
-          timeControl
+          timeControl,
+          undefined, // no roomId for bot games
+          playerColor === 'white' ? username : 'Bot',
+          playerColor === 'black' ? username : 'Bot'
         );
+
+        logger.info(`Bot game created: ${game.gameId}, initializing bot...`);
 
         // Create bot instance
         const bot = await botManager.createBot(game.gameId, difficulty);
+
+        logger.info(`Bot initialized for game ${game.gameId}`);
 
         // Join the game room
         socket.join(game.gameId);
@@ -629,6 +738,8 @@ export const registerChessNamespace = (io: Server) => {
           gameId: game.gameId,
           color: playerColor,
         });
+
+        logger.info(`Callback sent for game ${game.gameId}`);
 
         // Emit game-starting event
         socket.emit("game-starting", {
@@ -650,6 +761,7 @@ export const registerChessNamespace = (io: Server) => {
         }
       } catch (error) {
         logger.error(`Play with bot error: ${error instanceof Error ? error.message : "Unknown error"}`);
+        logger.error(`Error stack: ${error instanceof Error ? error.stack : "No stack trace"}`);
         callback?.({ success: false, error: "Failed to create bot game" });
       }
     });

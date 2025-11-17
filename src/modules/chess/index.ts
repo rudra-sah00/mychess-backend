@@ -1,1 +1,1 @@
-export * from "./chessGateway";
+export * from "./chessNamespace";

@@ -2,8 +2,10 @@ import { nanoid } from "nanoid";
 import ChessEngine, { MoveResult } from "./ChessEngine";
 import ClockService, { ClockConfig, ClockState } from "./ClockService";
 import { firebaseAdmin } from "../firebase/firebaseAdmin";
+import { gamePersistenceService } from "../firebase/GamePersistenceService";
 import logger from "../../config/logger";
 import { PieceSymbol } from "chess.js";
+import type { Server } from "socket.io";
 
 export interface Player {
   uid: string;
@@ -13,8 +15,8 @@ export interface Player {
 
 export interface GameData {
   gameId: string;
-  whitePlayer: { uid: string; socketId?: string };
-  blackPlayer: { uid: string; socketId?: string };
+  whitePlayer: { uid: string; socketId?: string; name?: string };
+  blackPlayer: { uid: string; socketId?: string; name?: string };
   fen: string;
   pgn: string;
   status: "waiting" | "active" | "completed";
@@ -27,6 +29,7 @@ export interface GameData {
   lastMoveAt?: number;
   drawOffer?: { from: "white" | "black"; pending: boolean };
   roomId?: string; // Associated room ID if created from room
+  gameType?: "bot" | "pvp"; // Type of game
 }
 
 export interface MoveData {
@@ -46,6 +49,19 @@ export class GameManager {
   private firestore = firebaseAdmin.getFirestore();
   private cleanupDelayMs = 30000; // 30 seconds delay before cleanup
   private cleanupTimers: Map<string, NodeJS.Timeout> = new Map();
+  private clockUpdateCallback?: (gameId: string, data: any) => void;
+  private botGameDisconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  private pvpDisconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  private waitingPlayers: Map<string, string> = new Map(); // gameId -> uid of waiting player
+  private io: Server | null = null;
+
+  setSocketIO(io: Server): void {
+    this.io = io;
+  }
+
+  setClockUpdateCallback(callback: (gameId: string, data: any) => void): void {
+    this.clockUpdateCallback = callback;
+  }
 
   async createGame(
     whiteUid: string,
@@ -53,16 +69,21 @@ export class GameManager {
     whiteSocketId: string,
     blackSocketId: string,
     clockConfig?: ClockConfig,
-    roomId?: string
+    roomId?: string,
+    whiteName?: string,
+    blackName?: string
   ): Promise<GameData> {
     const gameId = nanoid(10);
     const engine = new ChessEngine(gameId);
     const now = Date.now();
 
+    // Determine game type
+    const gameType = (whiteUid === 'BOT' || blackUid === 'BOT') ? 'bot' : 'pvp';
+
     const gameData: GameData = {
       gameId,
-      whitePlayer: { uid: whiteUid, socketId: whiteSocketId },
-      blackPlayer: { uid: blackUid, socketId: blackSocketId },
+      whitePlayer: { uid: whiteUid, socketId: whiteSocketId, name: whiteName },
+      blackPlayer: { uid: blackUid, socketId: blackSocketId, name: blackName },
       fen: engine.getFen(),
       pgn: engine.getPgn(),
       status: "active",
@@ -70,6 +91,7 @@ export class GameManager {
       createdAt: now,
       clockConfig,
       roomId,
+      gameType,
     };
 
     let clock: ClockService | undefined;
@@ -86,13 +108,24 @@ export class GameManager {
 
     this.games.set(gameId, { engine, clock, data: gameData });
 
-    await this.db.ref(`games/${gameId}`).set({
+    // Build Firebase data, excluding undefined values
+    const firebaseData: Record<string, any> = {
       ...gameData,
-      whitePlayer: { uid: whiteUid },
-      blackPlayer: { uid: blackUid },
-    });
+      whitePlayer: { uid: whiteUid, name: whiteName },
+      blackPlayer: { uid: blackUid, name: blackName },
+    };
 
-    logger.info(`Game created: ${gameId} (${whiteUid} vs ${blackUid})${clockConfig ? " with time control" : ""}`);
+    // Remove roomId if it's undefined (e.g., for bot games)
+    if (roomId === undefined) {
+      delete firebaseData.roomId;
+    }
+
+    await this.db.ref(`games/${gameId}`).set(firebaseData);
+
+    // Save initial persistence for active players
+    await this.updateGamePersistence(gameId);
+
+    logger.info(`Game created: ${gameId} (${whiteUid} vs ${blackUid})${clockConfig ? " with time control" : ""}, type: ${gameType}`);
     return gameData;
   }
 
@@ -131,6 +164,19 @@ export class GameManager {
     return this.games.get(gameId)?.data || null;
   }
 
+  async getMoveHistory(gameId: string): Promise<any[]> {
+    try {
+      const movesSnapshot = await this.db.ref(`games/${gameId}/moves`).once("value");
+      if (!movesSnapshot.exists()) {
+        return [];
+      }
+      return Object.values(movesSnapshot.val());
+    } catch (error) {
+      logger.error(`Error loading move history for game ${gameId}:`, error);
+      return [];
+    }
+  }
+
   async applyMove(gameId: string, uid: string, from: string, to: string, promotion?: string): Promise<MoveResult> {
     const game = this.games.get(gameId);
     if (!game) {
@@ -156,7 +202,7 @@ export class GameManager {
     const now = Date.now();
     data.fen = engine.getFen();
     data.pgn = engine.getPgn();
-    data.turn = data.turn === "w" ? "b" : "w";
+    data.turn = engine.getGameState().turn; // Get turn from engine (chess.js flips it after move)
     data.lastMoveAt = now;
 
     if (clock) {
@@ -178,30 +224,61 @@ export class GameManager {
     }
 
     const moveNumber = engine.getGameState().history.length;
-    const moveData: MoveData = {
+    
+    // Build move data, excluding undefined values for Firebase
+    const moveData: Record<string, any> = {
       moveNumber,
       from,
       to,
-      promotion,
       san: result.move!.san,
       color: playerColor,
       timestamp: now,
       clockState: data.clockState,
     };
 
+    // Only include promotion if it exists
+    if (promotion) {
+      moveData.promotion = promotion;
+    }
+
+    // Include captured piece if any
+    if (result.move!.captured) {
+      moveData.captured = result.move!.captured;
+    }
+
+    // Include flags (castling, en passant, etc.)
+    if (result.move!.flags) {
+      moveData.flags = result.move!.flags;
+    }
+
+    // Build update object, excluding undefined values
+    const gameUpdate: Record<string, any> = {
+      fen: data.fen,
+      pgn: data.pgn,
+      turn: data.turn,
+      lastMoveAt: data.lastMoveAt,
+      status: data.status,
+      clockState: data.clockState,
+    };
+
+    // Only include winner and endReason if game is over
+    if (result.isGameOver) {
+      gameUpdate.winner = data.winner;
+      gameUpdate.endReason = data.endReason;
+    }
+
     await Promise.all([
-      this.db.ref(`games/${gameId}`).update({
-        fen: data.fen,
-        pgn: data.pgn,
-        turn: data.turn,
-        lastMoveAt: data.lastMoveAt,
-        status: data.status,
-        winner: data.winner,
-        endReason: data.endReason,
-        clockState: data.clockState,
-      }),
+      this.db.ref(`games/${gameId}`).update(gameUpdate),
       this.db.ref(`games/${gameId}/moves/${moveNumber}`).set(moveData),
     ]);
+
+    // Update persistence after move
+    await this.updateGamePersistence(gameId);
+
+    // If game ended, save to match history
+    if (result.isGameOver) {
+      await this.saveMatchHistory(gameId);
+    }
 
     logger.info(`Move applied in game ${gameId}: ${from} to ${to} by ${uid}`);
     return result;
@@ -241,6 +318,9 @@ export class GameManager {
     });
 
     logger.info(`Player ${uid} resigned in game ${gameId}`);
+    
+    // Save to match history
+    await this.saveMatchHistory(gameId);
     
     // Schedule cleanup after resignation
     this.scheduleGameCleanup(gameId);
@@ -313,6 +393,9 @@ export class GameManager {
       });
 
       logger.info(`Draw accepted in game ${gameId}`);
+      
+      // Save to match history
+      await this.saveMatchHistory(gameId);
       
       // Schedule cleanup after draw
       this.scheduleGameCleanup(gameId);
@@ -410,12 +493,29 @@ export class GameManager {
       completedAt: game.data.lastMoveAt || Date.now(),
     };
 
+    // Remove undefined fields and temporary metadata for Firestore compatibility
+    delete (archiveData as any).roomId; // roomId is temporary, don't archive it
+    
+    Object.keys(archiveData).forEach(key => {
+      if (archiveData[key as keyof typeof archiveData] === undefined) {
+        delete archiveData[key as keyof typeof archiveData];
+      }
+    });
+
     try {
-      // Save to Firestore for permanent storage
-      await this.firestore.collection('completed_games').doc(gameId).set(archiveData);
+      // Save to Firestore under each player's UID
+      const whiteUid = game.data.whitePlayer.uid;
+      const blackUid = game.data.blackPlayer.uid;
       
-      // Optionally keep in Realtime DB archive (faster queries for recent games)
-      await this.db.ref(`archived_games/${gameId}`).set(archiveData);
+      // Store under white player's games
+      if (whiteUid !== 'BOT') {
+        await this.firestore.collection('users').doc(whiteUid).collection('games').doc(gameId).set(archiveData);
+      }
+      
+      // Store under black player's games
+      if (blackUid !== 'BOT') {
+        await this.firestore.collection('users').doc(blackUid).collection('games').doc(gameId).set(archiveData);
+      }
       
       // Delete from active games in Realtime DB
       await this.db.ref(`games/${gameId}`).remove();
@@ -423,7 +523,7 @@ export class GameManager {
       // Remove from memory
       this.removeGame(gameId);
       
-      logger.info(`Game ${gameId} cleaned up, saved to Firestore and archived in RTDB`);
+      logger.info(`Game ${gameId} cleaned up and saved to Firestore under player UIDs`);
     } catch (error) {
       logger.error(`Error cleaning up game ${gameId}:`, error);
       throw error;
@@ -470,11 +570,11 @@ export class GameManager {
   }
 
   /**
-   * Get completed game from Firestore archive
+   * Get completed game from Firestore (searches user's games)
    */
-  async getCompletedGame(gameId: string): Promise<GameData | null> {
+  async getCompletedGame(gameId: string, uid: string): Promise<GameData | null> {
     try {
-      const doc = await this.firestore.collection('completed_games').doc(gameId).get();
+      const doc = await this.firestore.collection('users').doc(uid).collection('games').doc(gameId).get();
       if (!doc.exists) {
         return null;
       }
@@ -491,30 +591,17 @@ export class GameManager {
   async getPlayerCompletedGames(uid: string, limit: number = 10): Promise<GameData[]> {
     try {
       const snapshot = await this.firestore
-        .collection('completed_games')
-        .where('whitePlayer.uid', '==', uid)
-        .orderBy('completedAt', 'desc')
-        .limit(limit)
-        .get();
-
-      const blackGamesSnapshot = await this.firestore
-        .collection('completed_games')
-        .where('blackPlayer.uid', '==', uid)
+        .collection('users')
+        .doc(uid)
+        .collection('games')
         .orderBy('completedAt', 'desc')
         .limit(limit)
         .get();
 
       const games: GameData[] = [];
       snapshot.forEach(doc => games.push(doc.data() as GameData));
-      blackGamesSnapshot.forEach(doc => games.push(doc.data() as GameData));
 
-      // Sort by completion time and deduplicate
-      return games
-        .filter((game, index, self) => 
-          index === self.findIndex(g => g.gameId === game.gameId)
-        )
-        .sort((a, b) => (b.lastMoveAt || 0) - (a.lastMoveAt || 0))
-        .slice(0, limit);
+      return games;
     } catch (error) {
       logger.error(`Error fetching player games for ${uid}:`, error);
       return [];
@@ -546,6 +633,29 @@ export class GameManager {
 
     logger.warn(`Game ${gameId} ended by timeout: ${timedOutColor}`);
     
+    // Notify players via socket
+    if (this.io) {
+      const chessNs = this.io.of('/chess');
+      chessNs?.to(gameId).emit('game-over', {
+        winner: result.winner,
+        reason: result.reason,
+        finalFen: engine.getFen(),
+        pgn: engine.getPgn(),
+      });
+      
+      // Remove all sockets from game room after timeout
+      const socketsInRoom = await chessNs?.in(gameId).fetchSockets();
+      if (socketsInRoom) {
+        for (const sock of socketsInRoom) {
+          sock.leave(gameId);
+        }
+        logger.info(`Removed ${socketsInRoom.length} sockets from game room ${gameId} after timeout`);
+      }
+    }
+    
+    // Save to match history
+    await this.saveMatchHistory(gameId);
+    
     // Schedule cleanup after timeout
     this.scheduleGameCleanup(gameId);
   }
@@ -558,6 +668,9 @@ export class GameManager {
 
     game.data.clockState = clockState;
     
+    // Update persistence with new clock state
+    this.updateGamePersistence(gameId);
+    
     // Emit clock update to all players in game
     if (this.clockUpdateCallback) {
       this.clockUpdateCallback(gameId, {
@@ -567,14 +680,338 @@ export class GameManager {
           black: { remaining: clockState.blackTimeMs },
         },
         turn: clockState.activeColor === 'w' ? 'white' : 'black',
+        activeColor: clockState.activeColor,
       });
     }
   }
-  
-  private clockUpdateCallback?: (gameId: string, data: any) => void;
-  
-  setClockUpdateCallback(callback: (gameId: string, data: any) => void): void {
-    this.clockUpdateCallback = callback;
+
+  /**
+   * Save/update active game to persistence layer
+   */
+  private async updateGamePersistence(gameId: string): Promise<void> {
+    const game = this.games.get(gameId);
+    if (!game || game.data.status !== 'active') {
+      return;
+    }
+
+    const { data } = game;
+    
+    // Save active game for white player (human only)
+    if (data.whitePlayer.uid !== 'BOT') {
+      await gamePersistenceService.saveActiveGame(data.whitePlayer.uid, {
+        gameId: data.gameId,
+        type: data.gameType || 'pvp',
+        playerUid: data.whitePlayer.uid,
+        opponentUid: data.blackPlayer.uid !== 'BOT' ? data.blackPlayer.uid : undefined,
+        playerColor: 'white',
+        fen: data.fen,
+        startedAt: data.createdAt,
+        lastUpdateAt: Date.now(),
+        status: 'active',
+        timeControl: data.clockConfig,
+        whiteTime: data.clockState?.whiteTimeMs,
+        blackTime: data.clockState?.blackTimeMs,
+      });
+    }
+
+    // Save active game for black player (human only)
+    if (data.blackPlayer.uid !== 'BOT') {
+      await gamePersistenceService.saveActiveGame(data.blackPlayer.uid, {
+        gameId: data.gameId,
+        type: data.gameType || 'pvp',
+        playerUid: data.blackPlayer.uid,
+        opponentUid: data.whitePlayer.uid !== 'BOT' ? data.whitePlayer.uid : undefined,
+        playerColor: 'black',
+        fen: data.fen,
+        startedAt: data.createdAt,
+        lastUpdateAt: Date.now(),
+        status: 'active',
+        timeControl: data.clockConfig,
+        whiteTime: data.clockState?.whiteTimeMs,
+        blackTime: data.clockState?.blackTimeMs,
+      });
+    }
+  }
+
+  /**
+   * Handle player disconnection
+   */
+  async handlePlayerDisconnect(gameId: string, uid: string): Promise<void> {
+    const game = this.games.get(gameId);
+    if (!game || game.data.status !== 'active') {
+      return;
+    }
+
+    // Mark as disconnected in persistence
+    await gamePersistenceService.updateGameStatus(uid, 'disconnected');
+    
+    logger.info(`Player ${uid} disconnected from game ${gameId}, waiting for reconnection...`);
+
+    // For bot games, set 1-minute cleanup timer
+    if (game.data.gameType === 'bot') {
+      const timerId = setTimeout(async () => {
+        const activeGame = await gamePersistenceService.getActiveGame(uid);
+        
+        // Check if player reconnected
+        if (activeGame && activeGame.status === 'disconnected' && activeGame.gameId === gameId) {
+          logger.warn(`Player ${uid} didn't rejoin bot game ${gameId} within 1 minute, cleaning up...`);
+          
+          // Clean up from RTDB
+          await gamePersistenceService.removeActiveGame(uid);
+          
+          // Clean up from server
+          this.games.delete(gameId);
+          this.botGameDisconnectTimers.delete(gameId);
+          
+          logger.info(`Bot game ${gameId} cleaned up from server and RTDB`);
+        }
+      }, 60000); // 1 minute
+      
+      this.botGameDisconnectTimers.set(gameId, timerId);
+      return;
+    }
+
+    // For PvP/friend games, handle disconnect differently
+    const opponentUid = game.data.whitePlayer.uid === uid ? game.data.blackPlayer.uid : game.data.whitePlayer.uid;
+    const opponentSocketId = game.data.whitePlayer.uid === uid ? game.data.blackPlayer.socketId : game.data.whitePlayer.socketId;
+    
+    // Check if opponent is also disconnected
+    const opponentActiveGame = await gamePersistenceService.getActiveGame(opponentUid);
+    
+    if (!opponentActiveGame || opponentActiveGame.status === 'disconnected') {
+      // Both players disconnected - cleanup immediately
+      logger.warn(`Both players disconnected from game ${gameId}, cleaning up immediately`);
+      
+      // Mark game as completed
+      game.data.status = 'completed';
+      game.data.winner = 'draw';
+      game.data.endReason = 'Both players disconnected';
+      game.data.lastMoveAt = Date.now();
+      
+      // Clean up active game refs
+      await gamePersistenceService.removeActiveGame(game.data.whitePlayer.uid);
+      await gamePersistenceService.removeActiveGame(game.data.blackPlayer.uid);
+      
+      // Schedule cleanup (will save to Firestore under player UIDs)
+      this.scheduleGameCleanup(gameId);
+      this.pvpDisconnectTimers.delete(gameId);
+      
+      return;
+    }
+    
+    // One player disconnected, other is waiting - emit waiting state to connected player
+    if (opponentSocketId && this.io) {
+      const chessNs = this.io.of('/chess');
+      
+      chessNs?.to(opponentSocketId).emit('opponent-disconnected', {
+        gameId,
+        message: 'Your opponent disconnected. Waiting for reconnection...',
+        showWaitButton: true
+      });
+      
+      // Mark opponent as waiting
+      this.waitingPlayers.set(gameId, opponentUid);
+    }
+    
+    // Set 1-minute timer for reconnection
+    const timerId = setTimeout(async () => {
+      const activeGame = await gamePersistenceService.getActiveGame(uid);
+      
+      // Check if player reconnected or if waiting was cancelled
+      if (activeGame && activeGame.status === 'disconnected' && activeGame.gameId === gameId) {
+        logger.warn(`Player ${uid} failed to reconnect to game ${gameId} within 1 minute`);
+        
+        // End the game - opponent wins
+        const playerColor = game.data.whitePlayer.uid === uid ? 'w' : 'b';
+        const winner = playerColor === 'w' ? 'black' : 'white';
+        const winnerName = playerColor === 'w' ? game.data.blackPlayer.name : game.data.whitePlayer.name;
+        
+        // Mark game as completed
+        game.data.status = 'completed';
+        game.data.winner = winner;
+        game.data.endReason = 'Opponent disconnected';
+        game.data.lastMoveAt = Date.now();
+        
+        // Clean up active game refs
+        await gamePersistenceService.removeActiveGame(game.data.whitePlayer.uid);
+        await gamePersistenceService.removeActiveGame(game.data.blackPlayer.uid);
+        this.pvpDisconnectTimers.delete(gameId);
+        this.waitingPlayers.delete(gameId);
+        
+        // Notify remaining player
+        if (opponentSocketId && this.io) {
+          const chessNs = this.io.of('/chess');
+          chessNs?.to(opponentSocketId).emit('game-ended-disconnect', {
+            gameId,
+            winner,
+            winnerName,
+            reason: 'Opponent failed to reconnect'
+          });
+          
+          // Remove all sockets from game room after disconnect timeout
+          const socketsInRoom = await chessNs?.in(gameId).fetchSockets();
+          if (socketsInRoom) {
+            for (const sock of socketsInRoom) {
+              sock.leave(gameId);
+            }
+            logger.info(`Removed ${socketsInRoom.length} sockets from game room ${gameId} after disconnect`);
+          }
+        }
+        
+        logger.info(`Game ${gameId} ended due to disconnect, winner: ${winnerName}`);
+        
+        // Schedule cleanup (will save to Firestore under player UIDs)
+        this.scheduleGameCleanup(gameId);
+      }
+    }, 60000); // 1 minute
+    
+    this.pvpDisconnectTimers.set(gameId, timerId);
+  }
+
+
+
+  /**
+   * Cancel wait timer - player chooses to wait indefinitely
+   */
+  async cancelWaitTimer(gameId: string, uid: string): Promise<void> {
+    const game = this.games.get(gameId);
+    if (!game) {
+      return;
+    }
+    
+    // Verify this player is the waiting one
+    if (this.waitingPlayers.get(gameId) !== uid) {
+      logger.warn(`Player ${uid} tried to cancel wait but is not the waiting player`);
+      return;
+    }
+    
+    // Clear the disconnect timer
+    if (this.pvpDisconnectTimers.has(gameId)) {
+      clearTimeout(this.pvpDisconnectTimers.get(gameId));
+      this.pvpDisconnectTimers.delete(gameId);
+      logger.info(`Player ${uid} chose to wait indefinitely for opponent in game ${gameId}`);
+      
+      // Notify the waiting player
+      const waitingSocketId = game.data.whitePlayer.uid === uid ? game.data.whitePlayer.socketId : game.data.blackPlayer.socketId;
+      if (waitingSocketId && this.io) {
+        const chessNs = this.io.of('/chess');
+        chessNs?.to(waitingSocketId).emit('waiting-confirmed', {
+          gameId,
+          message: 'Waiting for opponent to rejoin...'
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle player reconnection
+   */
+  async handlePlayerReconnect(gameId: string, uid: string): Promise<void> {
+    const game = this.games.get(gameId);
+    if (!game) {
+      return;
+    }
+
+    // Clear bot game disconnect timer if exists
+    if (game.data.gameType === 'bot' && this.botGameDisconnectTimers.has(gameId)) {
+      clearTimeout(this.botGameDisconnectTimers.get(gameId));
+      this.botGameDisconnectTimers.delete(gameId);
+      logger.info(`Cleared bot game disconnect timer for ${gameId}`);
+    }
+    
+    // Clear PvP disconnect timer if exists
+    if (this.pvpDisconnectTimers.has(gameId)) {
+      clearTimeout(this.pvpDisconnectTimers.get(gameId));
+      this.pvpDisconnectTimers.delete(gameId);
+      this.waitingPlayers.delete(gameId);
+      logger.info(`Cleared PvP disconnect timer for ${gameId}`);
+      
+      // Notify the waiting player that opponent reconnected
+      const opponentUid = game.data.whitePlayer.uid === uid ? game.data.blackPlayer.uid : game.data.whitePlayer.uid;
+      const opponentSocketId = game.data.whitePlayer.uid === uid ? game.data.blackPlayer.socketId : game.data.whitePlayer.socketId;
+      
+      if (opponentSocketId && this.io) {
+        const chessNs = this.io.of('/chess');
+        chessNs?.to(opponentSocketId).emit('opponent-reconnected', {
+          gameId,
+          message: 'Your opponent has reconnected!'
+        });
+      }
+    }
+
+    // Update status to active
+    await gamePersistenceService.updateGameStatus(uid, 'active');
+    logger.info(`Player ${uid} reconnected to game ${gameId}`);
+  }
+
+  /**
+   * Check for active game on connection
+   */
+  async checkActiveGame(uid: string): Promise<{ hasActiveGame: boolean; gameId?: string; gameData?: any }> {
+    const activeGame = await gamePersistenceService.checkReconnection(uid);
+    
+    if (!activeGame) {
+      return { hasActiveGame: false };
+    }
+
+    // Load the game if it exists
+    const game = await this.loadGame(activeGame.gameId);
+    
+    if (!game || game.status !== 'active') {
+      // Game no longer active, cleanup
+      await gamePersistenceService.removeActiveGame(uid);
+      return { hasActiveGame: false };
+    }
+
+    return {
+      hasActiveGame: true,
+      gameId: activeGame.gameId,
+      gameData: {
+        ...game,
+        reconnecting: true,
+      },
+    };
+  }
+
+  /**
+   * Save game to match history when it ends
+   */
+  private async saveMatchHistory(gameId: string): Promise<void> {
+    const game = this.games.get(gameId);
+    if (!game || game.data.status !== 'completed') {
+      return;
+    }
+
+    const { data } = game;
+    const players: { uid: string; name: string; color: "white" | "black" }[] = [];
+
+    // Add white player if not bot
+    if (data.whitePlayer.uid !== 'BOT') {
+      players.push({
+        uid: data.whitePlayer.uid,
+        name: data.whitePlayer.name || 'Player',
+        color: 'white',
+      });
+    }
+
+    // Add black player if not bot
+    if (data.blackPlayer.uid !== 'BOT') {
+      players.push({
+        uid: data.blackPlayer.uid,
+        name: data.blackPlayer.name || 'Player',
+        color: 'black',
+      });
+    }
+
+    await gamePersistenceService.handleGameEnd(
+      gameId,
+      players,
+      data.winner || 'draw',
+      data.gameType || 'pvp',
+      data.createdAt
+    );
+
+    logger.info(`Match history saved for game ${gameId}`);
   }
 }
 
