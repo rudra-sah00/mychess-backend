@@ -90,3 +90,5 @@ export const firebaseAdmin = {
   revokeRefreshTokens,
   getDatabase,
 };
+
+export default firebaseAdmin;

@@ -1,10 +1,5 @@
 import { Router, Request, Response } from "express";
-import {
-  verifyIdToken,
-  createSessionCookie,
-  verifySessionCookie,
-  revokeRefreshTokens,
-} from "../services/firebaseAdmin";
+import { firebaseAdmin } from "../services/firebase/firebaseAdmin";
 import logger from "../config/logger";
 
 const router = Router();
@@ -26,8 +21,8 @@ router.post("/google", async (req: Request, res: Response) => {
   }
 
   try {
-    const decodedToken = await verifyIdToken(idToken);
-    const sessionCookie = await createSessionCookie(idToken, MAX_AGE_MS);
+    const decodedToken = await firebaseAdmin.verifyIdToken(idToken);
+    const sessionCookie = await firebaseAdmin.createSessionCookie(idToken, MAX_AGE_MS);
 
     res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
       maxAge: MAX_AGE_MS,
@@ -60,10 +55,10 @@ router.post("/refresh", async (req: Request, res: Response) => {
   }
 
   try {
-    const decodedClaims = await verifySessionCookie(sessionCookie);
+    const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
     
     // Create new session cookie with fresh expiry
-    const newSessionCookie = await createSessionCookie(
+    const newSessionCookie = await firebaseAdmin.createSessionCookie(
       sessionCookie,
       MAX_AGE_MS
     );
@@ -97,8 +92,8 @@ router.post("/logout", async (req: Request, res: Response) => {
 
   if (sessionCookie) {
     try {
-      const decodedClaims = await verifySessionCookie(sessionCookie);
-      await revokeRefreshTokens(decodedClaims.uid);
+      const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
+      await firebaseAdmin.revokeRefreshTokens(decodedClaims.uid);
       logger.info(`User logged out: ${decodedClaims.uid}`);
     } catch (error) {
       logger.warn("Logout verification failed, clearing cookie anyway");
@@ -118,7 +113,7 @@ router.get("/status", async (req: Request, res: Response) => {
   }
 
   try {
-    const decodedClaims = await verifySessionCookie(sessionCookie);
+    const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
     return res.json({
       authenticated: true,
       uid: decodedClaims.uid,

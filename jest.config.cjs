@@ -5,4 +5,10 @@ module.exports = {
   moduleFileExtensions: ["ts", "js", "json"],
   roots: ["<rootDir>/src"],
   collectCoverageFrom: ["src/**/*.ts", "!src/**/*.d.ts"],
+  transform: {
+    "^.+\\.ts$": "ts-jest",
+  },
+  transformIgnorePatterns: [
+    "node_modules/(?!nanoid)",
+  ],
 };
