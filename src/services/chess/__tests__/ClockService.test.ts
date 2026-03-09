@@ -2,7 +2,7 @@ import { ClockService } from "../ClockService";
 
 describe("ClockService", () => {
   jest.setTimeout(10000);
-  
+
   let clock: ClockService | null = null;
 
   afterEach(() => {
@@ -44,7 +44,7 @@ describe("ClockService", () => {
 
     clock.start("w");
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    
+
     const state = clock.getState();
     expect(state.whiteTimeMs).toBeLessThan(5000);
     expect(state.whiteTimeMs).toBeGreaterThan(3000);
@@ -84,7 +84,7 @@ describe("ClockService", () => {
     expect(clock.getState().activeColor).toBeNull();
   });
 
-  it.skip("should call timeout callback when time runs out", (done) => {
+  it("should call timeout callback when time runs out", (done) => {
     clock = new ClockService(
       "test-game",
       {

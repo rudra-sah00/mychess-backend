@@ -1,10 +1,10 @@
 import { Socket } from "socket.io";
-import { firebaseAdmin } from "../services/firebase/firebaseAdmin";
+import { authService } from "../services/auth/authService";
 import logger from "../config/logger";
 
 /**
  * Socket.IO authentication middleware
- * Verifies session cookie or Firebase ID token and attaches uid to socket.data
+ * Verifies JWT token and attaches uid to socket.data
  */
 export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) => void): Promise<void> {
   try {
@@ -13,23 +13,23 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
 
     let uid: string | undefined;
 
-    // Try session cookie first (preferred for web clients)
+    // Try session cookie first
     if (sessionCookie) {
       try {
-        const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
+        const decodedClaims = authService.verifyToken(sessionCookie);
         uid = decodedClaims.uid;
       } catch (error) {
         logger.warn(`Invalid session cookie: ${error instanceof Error ? error.message : "Unknown error"}`);
       }
     }
 
-    // Fallback to ID token (for mobile clients or if session cookie invalid)
+    // Fallback to auth token payload (for mobile clients or if cookie invalid)
     if (!uid && token) {
       try {
-        const decodedToken = await firebaseAdmin.verifyIdToken(token);
+        const decodedToken = authService.verifyToken(token);
         uid = decodedToken.uid;
       } catch (error) {
-        logger.warn(`Invalid ID token: ${error instanceof Error ? error.message : "Unknown error"}`);
+        logger.warn(`Invalid JWT token: ${error instanceof Error ? error.message : "Unknown error"}`);
       }
     }
 
@@ -40,13 +40,13 @@ export async function socketAuthMiddleware(socket: Socket, next: (err?: Error) =
 
     // Attach uid to socket data for use in event handlers
     socket.data.uid = uid;
-    
+
     // Extract username from query params if available
     const username = socket.handshake.query.username as string | undefined;
     socket.data.username = username || 'Player';
-    
+
     logger.debug(`Socket authenticated: uid=${uid}, username=${socket.data.username}`);
-    
+
     next();
   } catch (error) {
     logger.error(`Socket authentication error: ${error instanceof Error ? error.message : "Unknown error"}`);

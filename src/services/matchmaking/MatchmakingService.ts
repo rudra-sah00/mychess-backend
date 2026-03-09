@@ -1,5 +1,5 @@
 import { gameManager } from "../chess/GameManager";
-import { firebaseAdmin } from "../firebase/firebaseAdmin";
+import redisClient from "../redis/redisClient";
 import logger from "../../config/logger";
 
 interface MatchmakingRequest {
@@ -26,7 +26,6 @@ interface QueuedPlayer {
 
 export class MatchmakingService {
   private queue: Map<string, QueuedPlayer> = new Map();
-  private db = firebaseAdmin.getDatabase();
   private matchFoundCallback?: (player1Uid: string, player2Uid: string, gameId: string) => void;
   private readonly DEFAULT_RATING = 1500;
   private readonly RATING_RANGE = 200;
@@ -54,13 +53,28 @@ export class MatchmakingService {
       timeControl: timeControl || this.DEFAULT_TIME_CONTROL,
       requestedAt: Date.now(),
     };
+
+    // Local state for fast lookup (could be entirely moved to redis, but kept for simplicity if single instance)
     this.queue.set(uid, queuedPlayer);
 
-    await this.db.ref(`matchmaking/queue/${uid}`).set(queuedPlayer);
+    // Redis: Store in a sorted set bounded by rating
+    await redisClient.zAdd("matchmaking:queue", {
+      score: queuedPlayer.rating,
+      value: uid
+    });
+    // Store player details in a hash
+    await redisClient.hSet(`matchmaking:player:${uid}`, {
+      socketId: queuedPlayer.socketId,
+      rating: queuedPlayer.rating.toString(),
+      initialTimeMs: queuedPlayer.timeControl.initialTimeMs.toString(),
+      incrementMs: queuedPlayer.timeControl.incrementMs.toString(),
+      requestedAt: queuedPlayer.requestedAt.toString()
+    });
 
     logger.info(`Player ${uid} joined matchmaking queue (rating: ${queuedPlayer.rating})`);
 
-    await this.tryMatchmaking(uid);
+    // Asynchronously try to find a match
+    this.tryMatchmaking(uid).catch(err => logger.error("Matchmaking error", err));
 
     return { success: true };
   }
@@ -71,7 +85,8 @@ export class MatchmakingService {
     }
 
     this.queue.delete(uid);
-    await this.db.ref(`matchmaking/queue/${uid}`).remove();
+    await redisClient.zRem("matchmaking:queue", uid);
+    await redisClient.del(`matchmaking:player:${uid}`);
 
     logger.info(`Player ${uid} left matchmaking queue`);
     return { success: true };
@@ -79,17 +94,33 @@ export class MatchmakingService {
 
   private async tryMatchmaking(uid: string): Promise<void> {
     const player = this.queue.get(uid);
-    if (!player) {
-      return;
-    }
+    if (!player) return;
+
+    // Look for opponents in redis within rating range
+    const minRating = player.rating - this.RATING_RANGE;
+    const maxRating = player.rating + this.RATING_RANGE;
+
+    const potentialOpponents = await redisClient.zRangeByScore("matchmaking:queue", minRating, maxRating);
 
     let bestMatch: QueuedPlayer | null = null;
     let bestRatingDiff = Infinity;
 
-    for (const [opponentUid, opponent] of this.queue) {
-      if (opponentUid === uid) {
-        continue;
-      }
+    for (const opponentUid of potentialOpponents) {
+      if (opponentUid === uid) continue;
+
+      const opponentData = await redisClient.hGetAll(`matchmaking:player:${opponentUid}`);
+      if (!opponentData || Object.keys(opponentData).length === 0) continue;
+
+      const opponent: QueuedPlayer = {
+        uid: opponentUid,
+        socketId: opponentData.socketId,
+        rating: parseInt(opponentData.rating, 10),
+        timeControl: {
+          initialTimeMs: parseInt(opponentData.initialTimeMs, 10),
+          incrementMs: parseInt(opponentData.incrementMs, 10),
+        },
+        requestedAt: parseInt(opponentData.requestedAt, 10)
+      };
 
       if (
         opponent.timeControl.initialTimeMs !== player.timeControl.initialTimeMs ||
@@ -113,10 +144,9 @@ export class MatchmakingService {
   private async createMatch(player1: QueuedPlayer, player2: QueuedPlayer): Promise<void> {
     this.queue.delete(player1.uid);
     this.queue.delete(player2.uid);
-    await Promise.all([
-      this.db.ref(`matchmaking/queue/${player1.uid}`).remove(),
-      this.db.ref(`matchmaking/queue/${player2.uid}`).remove(),
-    ]);
+
+    await redisClient.zRem("matchmaking:queue", [player1.uid, player2.uid]);
+    await redisClient.del([`matchmaking:player:${player1.uid}`, `matchmaking:player:${player2.uid}`]);
 
     const whitePlayer = Math.random() < 0.5 ? player1 : player2;
     const blackPlayer = whitePlayer === player1 ? player2 : player1;
@@ -133,11 +163,13 @@ export class MatchmakingService {
       `Match created: ${game.gameId} (${whitePlayer.uid} vs ${blackPlayer.uid}, ratings: ${whitePlayer.rating} vs ${blackPlayer.rating})`
     );
 
-    await this.db.ref(`matchmaking/matches/${game.gameId}`).set({
+    await redisClient.hSet(`matchmaking:matches:${game.gameId}`, {
       gameId: game.gameId,
-      whitePlayer: { uid: whitePlayer.uid, rating: whitePlayer.rating },
-      blackPlayer: { uid: blackPlayer.uid, rating: blackPlayer.rating },
-      createdAt: game.createdAt,
+      whitePlayerUid: whitePlayer.uid,
+      whitePlayerRating: whitePlayer.rating.toString(),
+      blackPlayerUid: blackPlayer.uid,
+      blackPlayerRating: blackPlayer.rating.toString(),
+      createdAt: game.createdAt.toString(),
     });
 
     if (this.matchFoundCallback) {

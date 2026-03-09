@@ -155,11 +155,12 @@ export class ClockService {
 
     const currentTime = this.state.activeColor === "w" ? this.state.whiteTimeMs : this.state.blackTimeMs;
     if (currentTime <= 0) {
-      logger.warn(`Player ${this.state.activeColor} timed out in game ${this.gameId}`);
+      const timedOutColor = this.state.activeColor;
+      logger.warn(`Player ${timedOutColor} timed out in game ${this.gameId}`);
       this.stop();
 
-      if (this.timeoutCallback && this.state.activeColor) {
-        this.timeoutCallback(this.state.activeColor);
+      if (this.timeoutCallback && timedOutColor) {
+        this.timeoutCallback(timedOutColor);
       }
       return;
     }

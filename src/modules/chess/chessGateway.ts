@@ -4,7 +4,7 @@ import { gameManager } from "../../services/chess/GameManager";
 import { matchmakingService } from "../../services/matchmaking/MatchmakingService";
 import { roomService } from "../../services/room/RoomService";
 import { BotManager, BotDifficulty } from "../../services/bot/BotService";
-import { gamePersistenceService } from "../../services/firebase/GamePersistenceService";
+import { gamePersistenceService } from "../../services/persistence/GamePersistenceService";
 import logger from "../../config/logger";
 
 const botManager = new BotManager();
@@ -119,7 +119,7 @@ export const registerChessNamespace = (io: Server) => {
     const activeGameCheck = await gameManager.checkActiveGame(uid);
     if (activeGameCheck.hasActiveGame) {
       logger.info(`Player ${uid} has active game: ${activeGameCheck.gameId}`);
-      
+
       // Notify client about active game (client will decide to rejoin or clear)
       socket.emit("active-game-found", {
         gameId: activeGameCheck.gameId,
@@ -262,7 +262,7 @@ export const registerChessNamespace = (io: Server) => {
             pgn: game.pgn,
           });
           logger.info(`Game ${gameId} ended: ${result.winner} (${result.reason})`);
-          
+
           // Clean up bot if exists
           if (botManager.getBot(gameId)) {
             botManager.removeBot(gameId);
@@ -383,9 +383,9 @@ export const registerChessNamespace = (io: Server) => {
 
       // Remove from matchmaking queue on disconnect
       matchmakingService.leaveQueue(uid);
-      
+
       // Leave room on disconnect
-      const result = roomService.leaveRoom(uid);
+      const result = await roomService.leaveRoom(uid);
       if (result.success && result.roomId && !result.disbanded) {
         const room = roomService.getRoom(result.roomId);
         if (room) {
@@ -401,19 +401,19 @@ export const registerChessNamespace = (io: Server) => {
       const activeGame = await gameManager.checkActiveGame(uid);
       if (activeGame.hasActiveGame && activeGame.gameId) {
         logger.info(`Player ${uid} disconnected from active game ${activeGame.gameId}`);
-        
+
         // Notify opponent
         socket.to(activeGame.gameId).emit("player-disconnected", { uid });
-        
+
         // Handle disconnection with timeout
         await gameManager.handlePlayerDisconnect(activeGame.gameId, uid);
       }
     });
 
     // Create room
-    socket.on("create-room", (payload: CreateRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
+    socket.on("create-room", async (payload: CreateRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
       try {
-        const result = roomService.createRoom(uid, socket.id, payload);
+        const result = await roomService.createRoom(uid, socket.id, payload);
 
         if (!result.success) {
           callback?.({ success: false, error: result.error });
@@ -432,9 +432,9 @@ export const registerChessNamespace = (io: Server) => {
     });
 
     // Join room
-    socket.on("join-room", (payload: JoinRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
+    socket.on("join-room", async (payload: JoinRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
       try {
-        const result = roomService.joinRoom(uid, socket.id, payload.roomId, payload.password);
+        const result = await roomService.joinRoom(uid, socket.id, payload.roomId, payload.password);
 
         if (!result.success) {
           callback?.({ success: false, error: result.error });
@@ -464,9 +464,9 @@ export const registerChessNamespace = (io: Server) => {
     });
 
     // Leave room
-    socket.on("leave-room", (callback?: (response: { success: boolean; disbanded?: boolean; error?: string }) => void) => {
+    socket.on("leave-room", async (callback?: (response: { success: boolean; disbanded?: boolean; error?: string }) => void) => {
       try {
-        const result = roomService.leaveRoom(uid);
+        const result = await roomService.leaveRoom(uid);
 
         if (!result.success) {
           callback?.({ success: false, error: result.error });
@@ -504,7 +504,7 @@ export const registerChessNamespace = (io: Server) => {
     // Set ready status
     socket.on("set-ready", async (payload: SetReadyPayload, callback?: (response: { success: boolean; allReady?: boolean; error?: string }) => void) => {
       try {
-        const result = roomService.setPlayerReady(uid, payload.isReady, payload.colorPreference);
+        const result = await roomService.setPlayerReady(uid, payload.isReady, payload.colorPreference);
 
         if (!result.success) {
           callback?.({ success: false, error: result.error });
@@ -528,14 +528,14 @@ export const registerChessNamespace = (io: Server) => {
 
           const room = result.room!;
           const [player1, player2] = room.players;
-          
+
           // Determine colors based on host's preference
           const host = room.players.find(p => p.uid === room.hostUid)!;
           const guest = room.players.find(p => p.uid !== room.hostUid)!;
-          
+
           let whitePlayer = player1;
           let blackPlayer = player2;
-          
+
           if (host.colorPreference === "white") {
             // Host wants white
             whitePlayer = host;
@@ -590,10 +590,10 @@ export const registerChessNamespace = (io: Server) => {
               clockState: gameData.clockState,
             },
           };
-          
+
           logger.info(`Emitting game-starting to room ${roomId} for game ${gameData.gameId}`);
           chessNs.in(roomId).emit("game-starting", gameStartingPayload);
-          
+
           // Also emit directly to both players as backup
           if (whitePlayer.socketId) {
             chessNs.to(whitePlayer.socketId).emit("game-starting", gameStartingPayload);
@@ -686,7 +686,7 @@ export const registerChessNamespace = (io: Server) => {
       callback?: (response: { success: boolean; gameId?: string; color?: string; error?: string }) => void
     ) => {
       logger.info(`🤖 Received play-with-bot request from ${uid} (${username}) - difficulty: ${payload.difficulty}`);
-      
+
       try {
         const { difficulty = 'medium', playerColor: requestedColor, timeControl } = payload;
 
@@ -708,7 +708,7 @@ export const registerChessNamespace = (io: Server) => {
 
         logger.info(`Creating bot game: player=${playerColor}, bot=${botColor}`)
 
-;
+          ;
 
         // Create game with player and bot
         const game = await gameManager.createGame(
@@ -795,7 +795,7 @@ async function makeBotMove(gameId: string, chessNs: any): Promise<void> {
 
     // Get best move from bot
     const moveStr = await bot.getBestMove(game.fen);
-    
+
     // Parse move string (e.g., "e2e4" or "e7e8q")
     const from = moveStr.substring(0, 2);
     const to = moveStr.substring(2, 4);

@@ -2,7 +2,7 @@ import { Socket } from "socket.io";
 import { gameManager } from "../../../services/chess/GameManager";
 import { BotDifficulty } from "../../../services/bot/BotService";
 import { botManager } from "../botManager";
-import { gamePersistenceService } from "../../../services/firebase/GamePersistenceService";
+import { gamePersistenceService } from "../../../services/persistence/GamePersistenceService";
 import logger from "../../../config/logger";
 
 interface PlayWithBotPayload {
@@ -24,7 +24,7 @@ export const registerBotHandlers = (socket: Socket, chessNs: any) => {
     callback?: (response: { success: boolean; gameId?: string; color?: string; error?: string }) => void
   ) => {
     logger.info(`🤖 Received play-with-bot request from ${uid} (${username}) - difficulty: ${payload.difficulty}`);
-    
+
     try {
       // Clear any existing active game for this user
       await gamePersistenceService.removeActiveGame(uid);
@@ -134,7 +134,7 @@ export async function makeBotMove(gameId: string, chessNs: any): Promise<void> {
 
     // Get best move from bot
     const moveStr = await bot.getBestMove(game.fen);
-    
+
     // Parse move string (e.g., "e2e4" or "e7e8q")
     const from = moveStr.substring(0, 2);
     const to = moveStr.substring(2, 4);

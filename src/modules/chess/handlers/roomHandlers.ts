@@ -28,9 +28,9 @@ export const registerRoomHandlers = (socket: Socket, chessNs: any) => {
   const username = socket.data.username as string || 'Player';
 
   // Create room
-  socket.on("create-room", (payload: CreateRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
+  socket.on("create-room", async (payload: CreateRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
     try {
-      const result = roomService.createRoom(uid, socket.id, payload);
+      const result = await roomService.createRoom(uid, socket.id, payload);
 
       if (!result.success) {
         callback?.({ success: false, error: result.error });
@@ -48,9 +48,9 @@ export const registerRoomHandlers = (socket: Socket, chessNs: any) => {
   });
 
   // Join room
-  socket.on("join-room", (payload: JoinRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
+  socket.on("join-room", async (payload: JoinRoomPayload, callback?: (response: { success: boolean; room?: unknown; error?: string }) => void) => {
     try {
-      const result = roomService.joinRoom(uid, socket.id, payload.roomId, payload.password);
+      const result = await roomService.joinRoom(uid, socket.id, payload.roomId, payload.password);
 
       if (!result.success) {
         callback?.({ success: false, error: result.error });
@@ -79,9 +79,9 @@ export const registerRoomHandlers = (socket: Socket, chessNs: any) => {
   });
 
   // Leave room
-  socket.on("leave-room", (callback?: (response: { success: boolean; disbanded?: boolean; error?: string }) => void) => {
+  socket.on("leave-room", async (callback?: (response: { success: boolean; disbanded?: boolean; error?: string }) => void) => {
     try {
-      const result = roomService.leaveRoom(uid);
+      const result = await roomService.leaveRoom(uid);
 
       if (!result.success) {
         callback?.({ success: false, error: result.error });
@@ -119,7 +119,7 @@ export const registerRoomHandlers = (socket: Socket, chessNs: any) => {
   // Set ready status
   socket.on("set-ready", async (payload: SetReadyPayload, callback?: (response: { success: boolean; allReady?: boolean; error?: string }) => void) => {
     try {
-      const result = roomService.setPlayerReady(uid, payload.isReady, payload.colorPreference);
+      const result = await roomService.setPlayerReady(uid, payload.isReady, payload.colorPreference);
 
       if (!result.success) {
         callback?.({ success: false, error: result.error });

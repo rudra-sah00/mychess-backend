@@ -2,7 +2,7 @@ import { Socket } from "socket.io";
 import { gameManager } from "../../../services/chess/GameManager";
 import { matchmakingService } from "../../../services/matchmaking/MatchmakingService";
 import { roomService } from "../../../services/room/RoomService";
-import { gamePersistenceService } from "../../../services/firebase/GamePersistenceService";
+import { gamePersistenceService } from "../../../services/persistence/GamePersistenceService";
 import logger from "../../../config/logger";
 
 export const registerConnectionHandlers = (socket: Socket, chessNs: any) => {
@@ -14,7 +14,7 @@ export const registerConnectionHandlers = (socket: Socket, chessNs: any) => {
     const activeGameCheck = await gameManager.checkActiveGame(uid);
     if (activeGameCheck.hasActiveGame) {
       logger.info(`Player ${uid} has active game: ${activeGameCheck.gameId}`);
-      
+
       // Notify client about active game (client will decide to rejoin or clear)
       socket.emit("active-game-found", {
         gameId: activeGameCheck.gameId,
@@ -47,9 +47,9 @@ export const registerConnectionHandlers = (socket: Socket, chessNs: any) => {
 
     // Remove from matchmaking queue on disconnect
     matchmakingService.leaveQueue(uid);
-    
+
     // Leave room on disconnect
-    const result = roomService.leaveRoom(uid);
+    const result = await roomService.leaveRoom(uid);
     if (result.success && result.roomId && !result.disbanded) {
       const room = roomService.getRoom(result.roomId);
       if (room) {
@@ -65,10 +65,10 @@ export const registerConnectionHandlers = (socket: Socket, chessNs: any) => {
     const activeGame = await gameManager.checkActiveGame(uid);
     if (activeGame.hasActiveGame && activeGame.gameId) {
       logger.info(`Player ${uid} disconnected from active game ${activeGame.gameId}`);
-      
+
       // Notify opponent
       socket.to(activeGame.gameId).emit("player-disconnected", { uid });
-      
+
       // Handle disconnection with timeout
       await gameManager.handlePlayerDisconnect(activeGame.gameId, uid);
     }

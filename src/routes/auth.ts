@@ -1,52 +1,105 @@
 import { Router, Request, Response } from "express";
-import { firebaseAdmin } from "../services/firebase/firebaseAdmin";
+import { PrismaClient } from "@prisma/client";
+import { authService } from "../services/auth/authService";
 import logger from "../config/logger";
 
 const router = Router();
+const prisma = new PrismaClient();
 
 const SESSION_COOKIE_NAME = "session";
+// Ensure ms conversion, authService expires assumes string "14d", for cookie we need MS.
 const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
 
-// POST /api/auth/google - Create session cookie from ID token
-router.post("/google", async (req: Request, res: Response) => {
-  const authHeader = req.headers.authorization;
-  const bearerToken = authHeader?.startsWith("Bearer ")
-    ? authHeader.slice(7)
-    : undefined;
+// POST /api/auth/register
+router.post("/register", async (req: Request, res: Response) => {
+  const { username, password } = req.body;
 
-  const idToken = (req.body?.idToken as string | undefined) || bearerToken;
-
-  if (!idToken) {
-    return res.status(400).json({ error: "idToken is required" });
+  if (!username || !password || typeof username !== "string" || typeof password !== "string") {
+    return res.status(400).json({ error: "Username and password are required" });
   }
 
   try {
-    const decodedToken = await firebaseAdmin.verifyIdToken(idToken);
-    const sessionCookie = await firebaseAdmin.createSessionCookie(idToken, MAX_AGE_MS);
+    const existingUser = await prisma.user.findUnique({ where: { username } });
+    if (existingUser) {
+      return res.status(409).json({ error: "Username already exists" });
+    }
 
-    res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
+    const passwordHash = await authService.hashPassword(password);
+    const user = await prisma.user.create({
+      data: {
+        username,
+        passwordHash,
+      },
+    });
+
+    const token = authService.generateToken({ uid: user.id, email: user.username });
+
+    res.cookie(SESSION_COOKIE_NAME, token, {
       maxAge: MAX_AGE_MS,
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
     });
 
-    logger.info(`User signed in: ${decodedToken.uid}`);
+    logger.info(`New user registered: ${user.id} (${user.username})`);
 
-    return res.json({
+    return res.status(201).json({
       success: true,
-      uid: decodedToken.uid,
+      uid: user.id,
+      username: user.username,
       expiresIn: MAX_AGE_MS,
     });
   } catch (error) {
-    logger.error("Sign-in failed", { error: error instanceof Error ? error.message : "unknown" });
-    return res.status(401).json({
-      error: error instanceof Error ? error.message : "invalid token",
-    });
+    logger.error("Registration failed", { error: error instanceof Error ? error.message : "unknown" });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// POST /api/auth/refresh - Extend session cookie
+// POST /api/auth/login
+router.post("/login", async (req: Request, res: Response) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password are required" });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({ where: { username } });
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const isValidPassword = await authService.comparePassword(password, user.passwordHash);
+
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const token = authService.generateToken({ uid: user.id, email: user.username });
+
+    res.cookie(SESSION_COOKIE_NAME, token, {
+      maxAge: MAX_AGE_MS,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+    });
+
+    logger.info(`User logged in: ${user.id}`);
+
+    return res.json({
+      success: true,
+      uid: user.id,
+      username: user.username,
+      expiresIn: MAX_AGE_MS,
+    });
+  } catch (error) {
+    logger.error("Login failed", { error: error instanceof Error ? error.message : "unknown" });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/auth/refresh - Not strictly needed for simple JWT, but kept to prevent breaking frontend
 router.post("/refresh", async (req: Request, res: Response) => {
   const sessionCookie = req.cookies?.[SESSION_COOKIE_NAME];
 
@@ -55,26 +108,23 @@ router.post("/refresh", async (req: Request, res: Response) => {
   }
 
   try {
-    const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
-    
-    // Create new session cookie with fresh expiry
-    const newSessionCookie = await firebaseAdmin.createSessionCookie(
-      sessionCookie,
-      MAX_AGE_MS
-    );
+    const decodedPayload = authService.verifyToken(sessionCookie);
 
-    res.cookie(SESSION_COOKIE_NAME, newSessionCookie, {
+    // Create new token to refresh expiry
+    const newToken = authService.generateToken({ uid: decodedPayload.uid, email: decodedPayload.email });
+
+    res.cookie(SESSION_COOKIE_NAME, newToken, {
       maxAge: MAX_AGE_MS,
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
     });
 
-    logger.info(`Session refreshed: ${decodedClaims.uid}`);
+    logger.info(`Session refreshed: ${decodedPayload.uid}`);
 
     return res.json({
       success: true,
-      uid: decodedClaims.uid,
+      uid: decodedPayload.uid,
       expiresIn: MAX_AGE_MS,
     });
   } catch (error) {
@@ -86,15 +136,14 @@ router.post("/refresh", async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/auth/logout - Clear session and revoke tokens
+// POST /api/auth/logout - Clear session cookie
 router.post("/logout", async (req: Request, res: Response) => {
   const sessionCookie = req.cookies?.[SESSION_COOKIE_NAME];
 
   if (sessionCookie) {
     try {
-      const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
-      await firebaseAdmin.revokeRefreshTokens(decodedClaims.uid);
-      logger.info(`User logged out: ${decodedClaims.uid}`);
+      const decodedPayload = authService.verifyToken(sessionCookie);
+      logger.info(`User logged out: ${decodedPayload.uid}`);
     } catch (error) {
       logger.warn("Logout verification failed, clearing cookie anyway");
     }
@@ -113,12 +162,19 @@ router.get("/status", async (req: Request, res: Response) => {
   }
 
   try {
-    const decodedClaims = await firebaseAdmin.verifySessionCookie(sessionCookie);
+    const decodedPayload = authService.verifyToken(sessionCookie);
+    const user = await prisma.user.findUnique({ where: { id: decodedPayload.uid } });
+
+    if (!user) {
+      res.clearCookie(SESSION_COOKIE_NAME);
+      return res.json({ authenticated: false });
+    }
+
     return res.json({
       authenticated: true,
-      uid: decodedClaims.uid,
-      email: decodedClaims.email,
-      expiresAt: decodedClaims.exp ? decodedClaims.exp * 1000 : null,
+      uid: user.id,
+      username: user.username,
+      rating: user.rating,
     });
   } catch (error) {
     res.clearCookie(SESSION_COOKIE_NAME);

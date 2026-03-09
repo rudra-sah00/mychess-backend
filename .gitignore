@@ -3,3 +3,5 @@ dist/
 .env
 ServiceAccountKey.json
 logs/
+
+/src/generated/prisma

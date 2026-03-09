@@ -5,39 +5,44 @@ jest.mock("nanoid", () => ({
   nanoid: jest.fn(() => "test-game-id-123"),
 }));
 
-// Mock Firebase
-jest.mock("../../firebase/firebaseAdmin", () => ({
-  firebaseAdmin: {
-    getDatabase: jest.fn(() => ({
-      ref: jest.fn(() => ({
-        set: jest.fn().mockResolvedValue(undefined),
-        update: jest.fn().mockResolvedValue(undefined),
-        remove: jest.fn().mockResolvedValue(undefined),
-        once: jest.fn().mockResolvedValue({
-          exists: () => false,
-          val: () => null,
-        }),
-      })),
-    })),
-    getFirestore: jest.fn(() => ({
-      collection: jest.fn(() => ({
-        doc: jest.fn(() => ({
-          set: jest.fn().mockResolvedValue(undefined),
-          get: jest.fn().mockResolvedValue({
-            exists: false,
-            data: () => null,
-          }),
-        })),
-        where: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        limit: jest.fn().mockReturnThis(),
-        get: jest.fn().mockResolvedValue({
-          forEach: jest.fn(),
-        }),
-      })),
-    })),
+
+// Mock Redis
+jest.mock("../../redis/redisClient", () => ({
+  __esModule: true,
+  default: {
+    get: jest.fn().mockResolvedValue(null),
+    set: jest.fn().mockResolvedValue("OK"),
+    setEx: jest.fn().mockResolvedValue("OK"),
+    del: jest.fn().mockResolvedValue(1),
+    zAdd: jest.fn().mockResolvedValue(1),
+    zRem: jest.fn().mockResolvedValue(1),
+    zRangeByScore: jest.fn().mockResolvedValue([]),
+    hSet: jest.fn().mockResolvedValue(1),
+    hGet: jest.fn().mockResolvedValue(null),
+    hGetAll: jest.fn().mockResolvedValue({}),
+    connect: jest.fn().mockResolvedValue(undefined),
+    on: jest.fn(),
   },
 }));
+
+// Mock Prisma
+jest.mock("@prisma/client", () => {
+  const mPrismaClient = {
+    game: {
+      create: jest.fn().mockResolvedValue({ id: 'mock-game-id', createdAt: new Date(), players: [] }),
+      update: jest.fn().mockResolvedValue({ id: 'mock-game-id' }),
+      findMany: jest.fn().mockResolvedValue([]),
+      findUnique: jest.fn().mockResolvedValue(null),
+    },
+    user: {
+      findUnique: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({ id: 'mock-user-id' }),
+    },
+    $connect: jest.fn().mockResolvedValue(undefined),
+    $disconnect: jest.fn().mockResolvedValue(undefined),
+  };
+  return { PrismaClient: jest.fn(() => mPrismaClient) };
+});
 
 describe("GameManager", () => {
   const mockWhiteUid = "white-user-123";
@@ -99,7 +104,7 @@ describe("GameManager", () => {
     });
   });
 
-  describe("applyMove", () => {
+describe("applyMove", () => {
     it("should apply valid move", async () => {
       const game = await gameManager.createGame(
         mockWhiteUid,
